@@ -539,18 +539,53 @@ function detach(){
   try{fileNode&&fileNode.disconnect(analyser)}catch(e){}
   try{genBus&&genBus.disconnect(analyser)}catch(e){}
 }
-const BLOCKED='Microphone access is blocked in this window. Open Signal Bench from its own web address (for example a GitHub Pages copy of the file) in Chrome or Safari to measure live. The generator loopback, audio files and the demo work here.';
+/* Mic access. Each failure gets its own message, because "blocked" has different causes and fixes per browser.
+   On iPhone the usual cause is the browser app itself lacking iOS microphone permission. */
+const ENV=(()=>{const ua=navigator.userAgent||'';
+  const ios=/iPad|iPhone|iPod/.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+  const android=/Android/.test(ua);
+  const browser=/CriOS/.test(ua)?'Chrome':/FxiOS/.test(ua)?'Firefox':/EdgiOS/.test(ua)?'Edge':ios&&/Safari\//.test(ua)?'Safari':/Chrome\//.test(ua)?'Chrome':/Firefox\//.test(ua)?'Firefox':/Safari\//.test(ua)?'Safari':'browser';
+  const inApp=ios&&!/Safari\//.test(ua); // WKWebView in-app browsers (Instagram, Gmail, etc.) drop the Safari token
+  let framed=false;try{framed=window.self!==window.top}catch(e){framed=true}
+  return{ios,android,browser,inApp,framed,secure:window.isSecureContext!==false}})();
+const HERE=location.protocol.startsWith('http')?location.href.split('#')[0]:'its own https address (for example GitHub Pages)';
+function micProblem(){
+  if(!ENV.secure)return 'The microphone only works on a secure https:// address. Open Signal Bench from its GitHub Pages address.';
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)
+    return ENV.inApp?'This in-app browser cannot use the microphone. Tap the ··· or share menu and choose Open in Safari (or Chrome).':'This browser does not offer microphone access. Use a current Chrome or Safari.';
+  return '';
+}
+function micErrorText(e){
+  const n=e&&e.name||'Error',tag=' ['+n+']';
+  if(ENV.framed&&(n==='NotAllowedError'||n==='SecurityError'))return 'This copy of Signal Bench is embedded inside another page, which does not let it use the microphone. Open '+HERE+' directly in Chrome or Safari. The demo, generator loopback and audio files still work here.'+tag;
+  if(n==='NotAllowedError'||n==='SecurityError'||n==='PermissionDeniedError'){
+    if(ENV.ios&&ENV.browser==='Chrome')return 'Chrome is not allowed to use the microphone. On the iPhone open Settings › Apps › Chrome and switch Microphone on. If Chrome asked and you tapped Don\'t Allow, reload this page and allow it. Then tap Try again.'+tag;
+    if(ENV.ios&&ENV.browser==='Safari')return 'Safari blocked the microphone for this site. Tap aA (or the page menu) in the address bar › Website Settings › Microphone › Allow, and check Settings › Apps › Safari › Microphone. Then reload and tap Try again.'+tag;
+    if(ENV.ios)return 'This browser is not allowed to use the microphone. Open Settings › Apps › '+ENV.browser+' and switch Microphone on, then reload and tap Try again.'+tag;
+    if(ENV.android)return 'Microphone permission was refused. Tap the icon left of the address › Permissions › Microphone › Allow, and make sure '+ENV.browser+' has microphone permission in Android Settings › Apps. Then tap Try again.'+tag;
+    return 'Microphone permission was refused. Click the icon left of the address bar, allow Microphone for this site, and check the system privacy settings allow '+ENV.browser+' to use the mic. Then tap Try again.'+tag;
+  }
+  if(n==='NotFoundError'||n==='DevicesNotFoundError')return 'No microphone was found. Plug one in (or check the interface is connected) and tap Try again.'+tag;
+  if(n==='NotReadableError'||n==='TrackStartError'||n==='AbortError')return 'The microphone is busy or failed to start. Close other apps or tabs using it (calls, voice memos, recorders) and tap Try again.'+tag;
+  return 'The microphone could not be opened: '+(e&&e.message||'unknown error')+'.'+tag;
+}
+const RETRY={label:'Try again',fn:()=>{hideNotice();setSource('mic')}};
 async function openMic(){
-  if(micStream)return true;
-  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){notice(BLOCKED,true);return false}
+  if(micStream){ensureCtx();return true}
+  const why=micProblem();if(why){notice(why,true);return false}
   const c={echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1};
   if(st.deviceId)c.deviceId={exact:st.deviceId};
-  try{micStream=await navigator.mediaDevices.getUserMedia({audio:c})}
+  // Ask for the mic first, then make the AudioContext, both inside the tap. iOS starts audio more reliably in that order.
+  let req;try{req=navigator.mediaDevices.getUserMedia({audio:c})}catch(e){req=Promise.reject(e)}
+  ensureCtx();
+  try{micStream=await req}
   catch(e){micStream=null;
-    if(e&&e.name==='OverconstrainedError'&&st.deviceId){st.deviceId='';return openMic()}
-    notice(e&&(e.name==='NotAllowedError'||e.name==='SecurityError')?BLOCKED:'The microphone could not be opened ('+(e&&e.message||'unknown error')+'). Check that no other app is using it.',true);return false}
+    if(e&&(e.name==='OverconstrainedError'||e.name==='NotFoundError')&&st.deviceId){st.deviceId='';save();return openMic()}
+    notice(micErrorText(e),true,RETRY);return false}
+  if(ctx.state!=='running'){try{await ctx.resume()}catch(e){}}
   micNode=ctx.createMediaStreamSource(micStream);
   const tr=micStream.getAudioTracks()[0],s=tr&&tr.getSettings?tr.getSettings():{};
+  if(tr)tr.addEventListener('ended',()=>{if(st.source==='mic'){notice('The microphone stopped (another app may have taken it).',true,RETRY);setSource('demo')}});
   const proc=[s.echoCancellation&&'echo cancellation',s.noiseSuppression&&'noise suppression',s.autoGainControl&&'automatic gain'].filter(Boolean);
   if(proc.length)notice('This browser kept '+proc.join(', ')+' switched on, so levels and spectrum will not be accurate. Chrome on a computer with a USB interface usually turns them off.',true);else hideNotice();
   fillDevices();requestWake();return true;
@@ -567,8 +602,7 @@ function releaseWake(){try{wake&&wake.release()}catch(e){}wake=null}
 
 async function setSource(s){
   if(s==='demo'){detach();closeMic();st.source='demo';setSr(48000);resetLeq();syncSource();return}
-  ensureCtx();
-  if(s==='mic'){if(!await openMic()){syncSource();return}}
+  if(s==='mic'){if(!await openMic()){syncSource();return}}else ensureCtx();
   if(s==='file'&&!fileNode){$('#fileField').hidden=false;$('#fileIn').click();return}
   if(s!=='mic')closeMic();
   detach();
@@ -590,7 +624,9 @@ function syncSource(){
 function syncBadge(){const b=$('#badge');b.className='badge'+(st.frozen?' frozen':st.source==='mic'?' live':'');
   b.textContent=st.frozen?'FROZEN':st.source==='mic'?'LIVE · MIC':SRC_NAME[st.source].toUpperCase();
   $$('.wire').forEach(w=>w.classList.toggle('flow',!st.frozen))}
-function notice(msg,warn){const n=$('#notice');n.textContent=msg;n.className='notice'+(warn?' warn':'');n.hidden=false}
+function notice(msg,warn,action){const n=$('#notice');n.textContent=msg;
+  if(action){const b=document.createElement('button');b.className='btn sm';b.textContent=action.label;b.style.marginLeft='10px';b.addEventListener('click',action.fn);n.append(' ',b)}
+  n.className='notice'+(warn?' warn':'');n.hidden=false}
 function hideNotice(){$('#notice').hidden=true}
 
 /* ---------- generator ---------- */
